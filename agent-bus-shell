@@ -1,12 +1,20 @@
 #!/bin/sh
 # agent-bus-shell: forced SSH command for the `bus` user.
-# Only permits agent-bus invocations against the fixed bus directory.
-# Install: /usr/local/bin/agent-bus-shell, referenced from
-# ~bus/.ssh/authorized_keys as command="/usr/local/bin/agent-bus-shell"
+# Binds one SSH key to one agent identity: the key's authorized_keys entry
+# names the agent, and every command the key runs is enforced as that agent.
+# Only `agent-bus` invocations are permitted, against the fixed bus directory.
+#
+# Install: /usr/local/bin/agent-bus-shell, referenced from ~bus/.ssh/authorized_keys as:
+#   restrict,command="/usr/local/bin/agent-bus-shell omni" <omni's public key>
+#   restrict,command="/usr/local/bin/agent-bus-shell openclaw" <openclaw's public key>
+#
+# Local shell users on the server are unrestricted; remote callers cannot use
+# --force, purge, or init.
+REMOTE_ID="$1"
 case "$SSH_ORIGINAL_COMMAND" in
   "agent-bus "*)
     # shellcheck disable=SC2086
-    exec /usr/local/bin/agent-bus --bus /srv/agent-bus ${SSH_ORIGINAL_COMMAND#agent-bus }
+    AGENT_BUS_REMOTE_ID="$REMOTE_ID" exec /usr/local/bin/agent-bus --bus /srv/agent-bus ${SSH_ORIGINAL_COMMAND#agent-bus }
     ;;
   *)
     echo "only agent-bus commands are allowed" >&2
