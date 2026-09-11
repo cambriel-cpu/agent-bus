@@ -1,0 +1,15 @@
+#!/bin/sh
+# agent-bus-shell: forced SSH command for the `bus` user.
+# Only permits agent-bus invocations against the fixed bus directory.
+# Install: /usr/local/bin/agent-bus-shell, referenced from
+# ~bus/.ssh/authorized_keys as command="/usr/local/bin/agent-bus-shell"
+case "$SSH_ORIGINAL_COMMAND" in
+  "agent-bus "*)
+    # shellcheck disable=SC2086
+    exec /usr/local/bin/agent-bus --bus /srv/agent-bus ${SSH_ORIGINAL_COMMAND#agent-bus }
+    ;;
+  *)
+    echo "only agent-bus commands are allowed" >&2
+    exit 1
+    ;;
+esac
