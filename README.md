@@ -13,8 +13,9 @@ directory (`/srv/agent-bus`); every write is temp-file + atomic rename.
 | `BUS_PROTOCOL.md` | The spec every agent follows — start here |
 | `SETUP.md` | Home server install steps (~5 min) |
 | `agent-bus` | Reference implementation (python3, stdlib only) |
-| `agent-bus-shell` | Forced SSH command for the restricted `bus` user |
+| `agent-bus-shell` | Forced SSH command for the restricted `bus` user (binds each key to one agent identity) |
 | `registry.seed.json` | Initial agent registry |
+| `tests/test_agent_bus.py` | Test suite (stdlib unittest): traversal, identity, corruption, concurrency |
 
 ## Quick start (home server)
 
