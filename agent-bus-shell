@@ -9,8 +9,16 @@
 #   restrict,command="/usr/local/bin/agent-bus-shell openclaw" <openclaw's public key>
 #
 # Local shell users on the server are unrestricted; remote callers cannot use
-# --force, purge, or init.
+# --force, purge, init, or recover. The identity argument is mandatory and
+# validated: a missing or unknown identity never dispatches.
 REMOTE_ID="$1"
+case "$REMOTE_ID" in
+  omni|openclaw|codex|claude) ;;
+  *)
+    echo "agent-bus-shell: missing or unknown identity" >&2
+    exit 1
+    ;;
+esac
 case "$SSH_ORIGINAL_COMMAND" in
   "agent-bus "*)
     # shellcheck disable=SC2086
