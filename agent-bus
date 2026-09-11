@@ -2,25 +2,37 @@
 """agent-bus: minimal inter-agent message bus. stdlib only.
 
 All state lives under --bus DIR. Every write is temp-file + atomic rename.
-See BUS_PROTOCOL.md for the full spec.
+Task files are immutable once created; state lives in the directory they sit
+in (open/claimed/done) plus atomic sidecar files. See BUS_PROTOCOL.md.
+
+Security model:
+  - Message/task IDs are validated against a strict pattern and contained
+    under their expected directory (no path traversal).
+  - When AGENT_BUS_REMOTE_ID is set (SSH forced command), the caller is bound
+    to that identity: --from and positional agent args must match it,
+    --force is denied, and purge/init are server-admin only.
 """
 import argparse
 import datetime
 import json
 import os
+import re
 import secrets
 import sys
 
 AGENTS = ("omni", "openclaw", "codex", "claude")
 MSG_TYPES = ("message", "question", "task-request", "task-update", "handoff", "broadcast")
+ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+TASK_STATES = ("open", "claimed", "done")
+
+
+def remote_id():
+    """Identity bound by the SSH forced command, or None for local use."""
+    return os.environ.get("AGENT_BUS_REMOTE_ID")
 
 
 def utcnow():
     return datetime.datetime.now(datetime.timezone.utc)
-
-
-def ts_compact(dt=None):
-    return (dt or utcnow()).strftime("%Y%m%dT%H%M%SZ")
 
 
 def ts_iso(dt=None):
@@ -28,7 +40,31 @@ def ts_iso(dt=None):
 
 
 def new_id(prefix=""):
-    return f"{prefix}{ts_compact()}-{secrets.token_hex(3)}"
+    return f"{prefix}{utcnow().strftime('%Y%m%dT%H%M%SZ')}-{secrets.token_hex(3)}"
+
+
+def valid_id(s, what="id"):
+    if not isinstance(s, str) or not ID_RE.fullmatch(s):
+        sys.exit(f"invalid {what}: {s!r}")
+    return s
+
+
+def contained(path, base):
+    """True if path resolves inside base (defense in depth after valid_id)."""
+    rp = os.path.realpath(path)
+    rb = os.path.realpath(base)
+    return rp == rb or rp.startswith(rb + os.sep)
+
+
+def require_self(agent, what="agent"):
+    rid = remote_id()
+    if rid and agent != rid:
+        sys.exit(f"remote identity is '{rid}': not authorized as '{agent}' ({what})")
+
+
+def require_local(what):
+    if remote_id():
+        sys.exit(f"{what} is a server-admin operation, not available remotely")
 
 
 def bus_dir(args):
@@ -43,12 +79,58 @@ def atomic_write(path, obj):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
         f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
 
 
-def load(path):
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
+def load_record(path):
+    """Load one JSON record; warn and return None instead of crashing."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            obj = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"warning: skipping unreadable record {path}: {e}", file=sys.stderr)
+        return None
+    if not isinstance(obj, dict):
+        print(f"warning: skipping non-object record {path}", file=sys.stderr)
+        return None
+    return obj
+
+
+def inbox_file(d, agent, mid, archived=False):
+    valid_id(mid, "message id")
+    base = os.path.join(d, "inbox", agent, "archive" if archived else "")
+    p = os.path.join(base, mid + ".json")
+    if not contained(p, os.path.join(d, "inbox", agent)):
+        sys.exit("path escape blocked")
+    return p
+
+
+def task_file(d, state, tid):
+    valid_id(tid, "task id")
+    base = os.path.join(d, "tasks", state)
+    p = os.path.join(base, tid + ".json")
+    if not contained(p, base):
+        sys.exit("path escape blocked")
+    return p
+
+
+def sidecar_path(d, state, tid, kind):
+    """kind is 'claim' or 'finish'; sidecars are written atomically."""
+    valid_id(tid, "task id")
+    base = os.path.join(d, "tasks", state)
+    p = os.path.join(base, f"{tid}.{kind}.json")
+    if not contained(p, base):
+        sys.exit("path escape blocked")
+    return p
+
+
+def read_sidecar(d, state, tid, kind):
+    p = sidecar_path(d, state, tid, kind)
+    if not os.path.exists(p):
+        return {}
+    return load_record(p) or {}
 
 
 def body_text(args):
@@ -59,9 +141,10 @@ def body_text(args):
 
 
 def cmd_init(args):
+    require_local("init")
     d = os.path.abspath(args.bus)
-    for sub in ["inbox/" + a for a in AGENTS] + ["inbox/" + a + "/archive" for a in AGENTS] \
-               + ["tasks/open", "tasks/claimed", "tasks/done", "log"]:
+    for sub in (["inbox/" + a for a in AGENTS] + ["inbox/" + a + "/archive" for a in AGENTS]
+                + ["tasks/open", "tasks/claimed", "tasks/done", "log"]):
         os.makedirs(os.path.join(d, sub), exist_ok=True)
     reg = os.path.join(d, "registry.json")
     if not os.path.exists(reg):
@@ -76,6 +159,7 @@ def cmd_init(args):
 
 def cmd_send(args):
     d = bus_dir(args)
+    require_self(args.sender, "--from")
     recipients = AGENTS if args.to == "*" else [args.to]
     if args.to != "*" and args.to not in AGENTS:
         sys.exit(f"unknown agent: {args.to} (known: {', '.join(AGENTS)})")
@@ -98,28 +182,30 @@ def cmd_send(args):
             "thread": args.thread,
             "expires_at": ts_iso(exp),
         }
-        atomic_write(os.path.join(d, "inbox", to, msg["id"] + ".json"), msg)
+        atomic_write(inbox_file(d, to, msg["id"]), msg)
         sent.append(msg["id"])
     print(json.dumps({"sent": sent, "to": list(recipients)}))
 
 
 def list_inbox(d, agent, include_expired=False):
-    if agent not in AGENTS:
-        sys.exit(f"unknown agent: {agent}")
+    require_self(agent, "inbox")
     now = ts_iso()
     out = []
     ibox = os.path.join(d, "inbox", agent)
     for fn in sorted(os.listdir(ibox)):
         if not fn.endswith(".json"):
             continue
-        msg = load(os.path.join(ibox, fn))
+        msg = load_record(os.path.join(ibox, fn))
+        if msg is None:
+            continue
         expired = msg.get("expires_at", "") < now
         if expired and not include_expired:
             continue
         out.append({
-            "id": msg["id"], "ts": msg["ts"], "from": msg["from"],
-            "type": msg["type"], "subject": msg["subject"],
-            "thread": msg.get("thread"), "expired": expired,
+            "id": msg.get("id", fn[:-5]), "ts": msg.get("ts", ""),
+            "from": msg.get("from", ""), "type": msg.get("type", ""),
+            "subject": msg.get("subject", ""), "thread": msg.get("thread"),
+            "expired": expired,
         })
     return out
 
@@ -139,111 +225,163 @@ def cmd_inbox(args):
 
 def cmd_read(args):
     d = bus_dir(args)
-    p = os.path.join(d, "inbox", args.agent, args.msgid + ".json")
+    require_self(args.agent, "read")
+    p = inbox_file(d, args.agent, args.msgid)
     if not os.path.exists(p):
-        p = os.path.join(d, "inbox", args.agent, "archive", args.msgid + ".json")
+        p = inbox_file(d, args.agent, args.msgid, archived=True)
     if not os.path.exists(p):
         sys.exit(f"message not found: {args.msgid}")
-    print(json.dumps(load(p), indent=2, ensure_ascii=False))
+    msg = load_record(p)
+    if msg is None:
+        sys.exit(f"message unreadable: {args.msgid}")
+    print(json.dumps(msg, indent=2, ensure_ascii=False))
 
 
 def cmd_ack(args):
     d = bus_dir(args)
+    require_self(args.agent, "ack")
     acked = []
     for mid in args.msgids:
-        src = os.path.join(d, "inbox", args.agent, mid + ".json")
+        src = inbox_file(d, args.agent, mid)
         if not os.path.exists(src):
             print(f"skip (not found): {mid}", file=sys.stderr)
             continue
-        os.replace(src, os.path.join(d, "inbox", args.agent, "archive", mid + ".json"))
+        os.replace(src, inbox_file(d, args.agent, mid, archived=True))
         acked.append(mid)
     print(json.dumps({"acked": acked}))
 
 
 def cmd_propose(args):
     d = bus_dir(args)
+    require_self(args.sender, "--from")
     task = {
         "id": new_id("task-"),
         "ts": ts_iso(),
         "proposed_by": args.sender,
         "subject": args.subject,
         "body": body_text(args),
-        "status": "open",
-        "claimed_by": None, "claimed_at": None,
-        "finished_at": None, "finish_note": None,
     }
-    atomic_write(os.path.join(d, "tasks", "open", task["id"] + ".json"), task)
+    atomic_write(task_file(d, "open", task["id"]), task)
     print(json.dumps({"proposed": task["id"]}))
+
+
+def find_task(d, tid):
+    """Return (state, path) for a task id, or (None, None)."""
+    for state in TASK_STATES:
+        p = task_file(d, state, tid)
+        if os.path.exists(p):
+            return state, p
+    return None, None
 
 
 def cmd_claim(args):
     d = bus_dir(args)
-    src = os.path.join(d, "tasks", "open", args.taskid + ".json")
-    dst = os.path.join(d, "tasks", "claimed", args.taskid + ".json")
-    if not os.path.exists(src):
-        # already claimed or unknown
-        alt = os.path.join(d, "tasks", "claimed", args.taskid + ".json")
-        if os.path.exists(alt):
-            t = load(alt)
-            sys.exit(f"already claimed by {t.get('claimed_by')} at {t.get('claimed_at')}")
-        sys.exit(f"task not found: {args.taskid}")
-    task = load(src)
-    task["status"] = "claimed"
-    task["claimed_by"] = args.agent
-    task["claimed_at"] = ts_iso()
-    os.replace(src, dst)          # atomic: the lock
-    atomic_write(dst, task)
-    print(json.dumps({"claimed": args.taskid, "by": args.agent}))
+    require_self(args.agent, "claim")
+    tid = valid_id(args.taskid, "task id")
+    src = task_file(d, "open", tid)
+    dst = task_file(d, "claimed", tid)
+    state, _ = find_task(d, tid)
+    if state != "open":
+        if state == "claimed":
+            by = read_sidecar(d, "claimed", tid, "claim").get("claimed_by")
+            sys.exit(f"already claimed by {by or 'unknown'}")
+        sys.exit(f"task not found: {tid}")
+    if load_record(src) is None:
+        sys.exit(f"task unreadable, not claiming: {tid}")
+    # The rename is the atomic claim: exactly one racing claimant succeeds.
+    try:
+        os.replace(src, dst)
+    except FileNotFoundError:
+        by = read_sidecar(d, "claimed", tid, "claim").get("claimed_by")
+        sys.exit(f"already claimed by {by or 'unknown'}")
+    # Sidecar is written only by the winner, after winning. A crash here
+    # leaves the task correctly in claimed/ with unknown claimer — degraded
+    # metadata, never contradictory state.
+    atomic_write(sidecar_path(d, "claimed", tid, "claim"),
+                 {"claimed_by": args.agent, "claimed_at": ts_iso()})
+    print(json.dumps({"claimed": tid, "by": args.agent}))
 
 
 def cmd_release(args):
     d = bus_dir(args)
-    src = os.path.join(d, "tasks", "claimed", args.taskid + ".json")
-    if not os.path.exists(src):
-        sys.exit(f"task not claimed: {args.taskid}")
-    task = load(src)
-    if task.get("claimed_by") != args.agent and not args.force:
-        sys.exit(f"claimed by {task.get('claimed_by')}; use --force to override")
-    task["status"] = "open"
-    task["claimed_by"] = None
-    task["claimed_at"] = None
-    dst = os.path.join(d, "tasks", "open", args.taskid + ".json")
-    os.replace(src, dst)
-    atomic_write(dst, task)
-    print(json.dumps({"released": args.taskid}))
+    require_self(args.agent, "release")
+    if args.force and remote_id():
+        sys.exit("--force is not available remotely")
+    tid = valid_id(args.taskid, "task id")
+    src = task_file(d, "claimed", tid)
+    if load_record(src) is None:
+        sys.exit(f"task not claimed: {tid}")
+    claimed_by = read_sidecar(d, "claimed", tid, "claim").get("claimed_by")
+    if claimed_by is None:
+        print("warning: claim sidecar missing; releasing anyway", file=sys.stderr)
+    elif claimed_by != args.agent and not args.force:
+        sys.exit(f"claimed by {claimed_by}; use --force to override")
+    os.replace(src, task_file(d, "open", tid))
+    try:
+        os.unlink(sidecar_path(d, "claimed", tid, "claim"))
+    except FileNotFoundError:
+        pass
+    print(json.dumps({"released": tid}))
 
 
 def cmd_finish(args):
     d = bus_dir(args)
-    src = os.path.join(d, "tasks", "claimed", args.taskid + ".json")
-    if not os.path.exists(src):
-        sys.exit(f"task not claimed: {args.taskid}")
-    task = load(src)
-    if task.get("claimed_by") != args.agent and not args.force:
-        sys.exit(f"claimed by {task.get('claimed_by')}; use --force to override")
-    task["status"] = "done"
-    task["finished_at"] = ts_iso()
-    task["finish_note"] = args.note or ""
-    dst = os.path.join(d, "tasks", "done", args.taskid + ".json")
-    os.replace(src, dst)
-    atomic_write(dst, task)
-    print(json.dumps({"finished": args.taskid}))
+    require_self(args.agent, "finish")
+    if args.force and remote_id():
+        sys.exit("--force is not available remotely")
+    tid = valid_id(args.taskid, "task id")
+    src = task_file(d, "claimed", tid)
+    if load_record(src) is None:
+        sys.exit(f"task not claimed: {tid}")
+    claimed_by = read_sidecar(d, "claimed", tid, "claim").get("claimed_by")
+    if claimed_by is None:
+        print("warning: claim sidecar missing; finishing anyway", file=sys.stderr)
+    elif claimed_by != args.agent and not args.force:
+        sys.exit(f"claimed by {claimed_by}; use --force to override")
+    os.replace(src, task_file(d, "done", tid))
+    try:
+        os.unlink(sidecar_path(d, "claimed", tid, "claim"))
+    except FileNotFoundError:
+        pass
+    atomic_write(sidecar_path(d, "done", tid, "finish"),
+                 {"finished_by": args.agent, "finished_at": ts_iso(),
+                  "finish_note": args.note or ""})
+    print(json.dumps({"finished": tid}))
+
+
+def task_view(d, state, tid, task):
+    view = {
+        "id": tid, "state": state,
+        "subject": task.get("subject", ""), "proposed_by": task.get("proposed_by", ""),
+        "claimed_by": None, "claimed_at": None,
+        "finished_by": None, "finished_at": None, "finish_note": None,
+    }
+    if state == "claimed":
+        sc = read_sidecar(d, state, tid, "claim")
+        view["claimed_by"] = sc.get("claimed_by")
+        view["claimed_at"] = sc.get("claimed_at")
+    elif state == "done":
+        sc = read_sidecar(d, state, tid, "finish")
+        view["finished_by"] = sc.get("finished_by")
+        view["finished_at"] = sc.get("finished_at")
+        view["finish_note"] = sc.get("finish_note")
+    return view
 
 
 def cmd_tasks(args):
     d = bus_dir(args)
-    states = [args.state] if args.state != "all" else ["open", "claimed", "done"]
+    states = [args.state] if args.state != "all" else list(TASK_STATES)
     out = []
-    for st in states:
-        tdir = os.path.join(d, "tasks", st)
+    for state in states:
+        tdir = os.path.join(d, "tasks", state)
         for fn in sorted(os.listdir(tdir)):
-            if not fn.endswith(".json"):
+            if not fn.endswith(".json") or fn.endswith(".claim.json") or fn.endswith(".finish.json"):
                 continue
-            t = load(os.path.join(tdir, fn))
-            out.append({
-                "id": t["id"], "state": st, "subject": t["subject"],
-                "proposed_by": t.get("proposed_by"), "claimed_by": t.get("claimed_by"),
-            })
+            tid = fn[:-5]
+            task = load_record(os.path.join(tdir, fn))
+            if task is None:
+                continue
+            out.append(task_view(d, state, tid, task))
     if args.json:
         print(json.dumps(out, indent=2))
     elif not out:
@@ -256,16 +394,19 @@ def cmd_tasks(args):
 
 def cmd_registry(args):
     d = bus_dir(args)
-    reg = load(os.path.join(d, "registry.json"))
+    reg = load_record(os.path.join(d, "registry.json"))
+    if reg is None:
+        sys.exit("registry unreadable")
     if args.json:
         print(json.dumps(reg, indent=2))
     else:
         for name, info in reg.get("agents", {}).items():
-            print(f"{name}: {info.get('desc','')} [polls: {info.get('cadence','')}]")
+            print(f"{name}: {info.get('desc', '')} [polls: {info.get('cadence', '')}]")
 
 
 def cmd_log(args):
     d = bus_dir(args)
+    require_self(args.sender, "--from")
     line = json.dumps({"ts": ts_iso(), "from": args.sender, "event": args.event},
                       ensure_ascii=False)
     with open(os.path.join(d, "log", utcnow().strftime("%Y-%m-%d") + ".jsonl"),
@@ -274,13 +415,34 @@ def cmd_log(args):
     print("logged")
 
 
+def cmd_purge(args):
+    require_local("purge")
+    d = bus_dir(args)
+    cutoff = ts_iso(utcnow() - datetime.timedelta(days=args.grace_days))
+    removed = []
+    for agent in AGENTS:
+        ibox = os.path.join(d, "inbox", agent)
+        for fn in sorted(os.listdir(ibox)):
+            if not fn.endswith(".json"):
+                continue
+            p = os.path.join(ibox, fn)
+            msg = load_record(p)
+            if msg is None:
+                continue
+            if msg.get("expires_at", "") < cutoff:
+                removed.append(f"{agent}/{fn[:-5]}")
+                if not args.dry_run:
+                    os.unlink(p)
+    print(json.dumps({"purged": sorted(removed), "dry_run": args.dry_run}))
+
+
 def add_common_body(p):
     g = p.add_mutually_exclusive_group()
     g.add_argument("--body", default="")
     g.add_argument("--body-file")
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(prog="agent-bus")
     ap.add_argument("--bus", default="/srv/agent-bus")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -348,11 +510,16 @@ def main():
     p.add_argument("--from", dest="sender", required=True, choices=AGENTS)
     p.add_argument("--event", required=True)
 
-    args = ap.parse_args()
+    p = sub.add_parser("purge")
+    p.add_argument("--grace-days", type=int, default=7,
+                   help="only purge messages expired longer ago than this")
+    p.add_argument("--dry-run", action="store_true")
+
+    args = ap.parse_args(argv)
     {"init": cmd_init, "send": cmd_send, "broadcast": cmd_send, "inbox": cmd_inbox,
      "read": cmd_read, "ack": cmd_ack, "propose": cmd_propose, "claim": cmd_claim,
      "release": cmd_release, "finish": cmd_finish, "tasks": cmd_tasks,
-     "registry": cmd_registry, "log": cmd_log}[args.cmd](args)
+     "registry": cmd_registry, "log": cmd_log, "purge": cmd_purge}[args.cmd](args)
 
 
 if __name__ == "__main__":
