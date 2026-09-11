@@ -18,17 +18,30 @@ import json
 import os
 import re
 import secrets
+import shutil
 import sys
 
 AGENTS = ("omni", "openclaw", "codex", "claude")
 MSG_TYPES = ("message", "question", "task-request", "task-update", "handoff", "broadcast")
 ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 TASK_STATES = ("open", "claimed", "done")
+# Shared group for the bus user and local agent users. Overridable for tests.
+BUS_GROUP = os.environ.get("AGENT_BUS_GROUP", "agent-bus")
 
 
 def remote_id():
     """Identity bound by the SSH forced command, or None for local use."""
     return os.environ.get("AGENT_BUS_REMOTE_ID")
+
+
+def check_remote_identity():
+    """Fail closed: presence of AGENT_BUS_REMOTE_ID means remote mode, and
+    the value must be a known agent. An empty or unknown value is never
+    treated as unrestricted local access."""
+    if "AGENT_BUS_REMOTE_ID" in os.environ:
+        rid = os.environ["AGENT_BUS_REMOTE_ID"]
+        if rid not in AGENTS:
+            sys.exit(f"unknown remote identity: {rid!r}")
 
 
 def utcnow():
@@ -133,6 +146,27 @@ def read_sidecar(d, state, tid, kind):
     return load_record(p) or {}
 
 
+def claim_owner(d, tid):
+    """Return the claiming agent, or None if the claim sidecar is missing,
+    corrupt, or names an unknown agent (orphaned claim)."""
+    sc = read_sidecar(d, "claimed", tid, "claim")
+    by = sc.get("claimed_by")
+    return by if by in AGENTS else None
+
+
+def find_orphans(d):
+    """Task ids sitting in claimed/ without valid claim metadata."""
+    orphans = []
+    cdir = os.path.join(d, "tasks", "claimed")
+    for fn in sorted(os.listdir(cdir)):
+        if not fn.endswith(".json") or fn.endswith(".claim.json"):
+            continue
+        tid = fn[:-5]
+        if claim_owner(d, tid) is None:
+            orphans.append(tid)
+    return orphans
+
+
 def body_text(args):
     if args.body_file:
         with open(args.body_file, encoding="utf-8") as f:
@@ -143,8 +177,9 @@ def body_text(args):
 def cmd_init(args):
     require_local("init")
     d = os.path.abspath(args.bus)
-    for sub in (["inbox/" + a for a in AGENTS] + ["inbox/" + a + "/archive" for a in AGENTS]
-                + ["tasks/open", "tasks/claimed", "tasks/done", "log"]):
+    subdirs = (["inbox/" + a for a in AGENTS] + ["inbox/" + a + "/archive" for a in AGENTS]
+               + ["tasks/open", "tasks/claimed", "tasks/done", "log"])
+    for sub in subdirs:
         os.makedirs(os.path.join(d, sub), exist_ok=True)
     reg = os.path.join(d, "registry.json")
     if not os.path.exists(reg):
@@ -154,7 +189,38 @@ def cmd_init(args):
                 atomic_write(reg, json.load(f))
         else:
             atomic_write(reg, {"agents": {a: {"desc": "", "cadence": ""} for a in AGENTS}})
+    apply_bus_perms(d)
     print(f"bus ready at {d}")
+
+
+def _secure_dir(p):
+    try:
+        shutil.chown(p, group=BUS_GROUP)
+    except (LookupError, PermissionError, OSError) as e:
+        print(f"warning: cannot set group on {p}: {e}", file=sys.stderr)
+    try:
+        os.chmod(p, 0o2770)
+    except OSError as e:
+        print(f"warning: cannot chmod {p}: {e}", file=sys.stderr)
+
+
+def apply_bus_perms(d):
+    """Idempotent permission setup: group BUS_GROUP owns everything,
+    directories are 2770 (setgid, group-only), registry is 660."""
+    _secure_dir(d)
+    try:
+        for root, dirs, _ in os.walk(d):
+            for name in dirs:
+                _secure_dir(os.path.join(root, name))
+    except OSError as e:
+        print(f"warning: permission walk failed: {e}", file=sys.stderr)
+    reg = os.path.join(d, "registry.json")
+    if os.path.exists(reg):
+        try:
+            shutil.chown(reg, group=BUS_GROUP)
+            os.chmod(reg, 0o660)
+        except (LookupError, PermissionError, OSError) as e:
+            print(f"warning: cannot secure {reg}: {e}", file=sys.stderr)
 
 
 def cmd_send(args):
@@ -311,11 +377,12 @@ def cmd_release(args):
     src = task_file(d, "claimed", tid)
     if load_record(src) is None:
         sys.exit(f"task not claimed: {tid}")
-    claimed_by = read_sidecar(d, "claimed", tid, "claim").get("claimed_by")
-    if claimed_by is None:
-        print("warning: claim sidecar missing; releasing anyway", file=sys.stderr)
-    elif claimed_by != args.agent and not args.force:
-        sys.exit(f"claimed by {claimed_by}; use --force to override")
+    owner = claim_owner(d, tid)
+    if owner is None:
+        sys.exit(f"orphaned claim (missing or invalid claim metadata); "
+                 f"a server admin must run `recover`")
+    if owner != args.agent and not args.force:
+        sys.exit(f"claimed by {owner}; use --force to override")
     os.replace(src, task_file(d, "open", tid))
     try:
         os.unlink(sidecar_path(d, "claimed", tid, "claim"))
@@ -333,11 +400,12 @@ def cmd_finish(args):
     src = task_file(d, "claimed", tid)
     if load_record(src) is None:
         sys.exit(f"task not claimed: {tid}")
-    claimed_by = read_sidecar(d, "claimed", tid, "claim").get("claimed_by")
-    if claimed_by is None:
-        print("warning: claim sidecar missing; finishing anyway", file=sys.stderr)
-    elif claimed_by != args.agent and not args.force:
-        sys.exit(f"claimed by {claimed_by}; use --force to override")
+    owner = claim_owner(d, tid)
+    if owner is None:
+        sys.exit(f"orphaned claim (missing or invalid claim metadata); "
+                 f"a server admin must run `recover`")
+    if owner != args.agent and not args.force:
+        sys.exit(f"claimed by {owner}; use --force to override")
     os.replace(src, task_file(d, "done", tid))
     try:
         os.unlink(sidecar_path(d, "claimed", tid, "claim"))
@@ -349,17 +417,50 @@ def cmd_finish(args):
     print(json.dumps({"finished": tid}))
 
 
+def cmd_recover(args):
+    require_local("recover")
+    d = bus_dir(args)
+    orphans = find_orphans(d)
+    if args.list:
+        if args.json:
+            print(json.dumps({"orphans": orphans}, indent=2))
+        elif not orphans:
+            print("(no orphaned claims)")
+        else:
+            for tid in orphans:
+                print(tid)
+        return
+    tid = valid_id(args.taskid, "task id")
+    if tid not in orphans:
+        sys.exit(f"not an orphaned claim: {tid}")
+    now = ts_iso()
+    if args.release:
+        os.replace(task_file(d, "claimed", tid), task_file(d, "open", tid))
+        _log_event(d, "admin", f"recover: released orphaned claim {tid} to open")
+        print(json.dumps({"recovered": tid, "action": "release"}))
+    else:
+        os.replace(task_file(d, "claimed", tid), task_file(d, "done", tid))
+        atomic_write(sidecar_path(d, "done", tid, "finish"),
+                     {"finished_by": "admin", "finished_at": now,
+                      "finish_note": args.note or "",
+                      "recovered_by": "admin", "recovered_at": now})
+        _log_event(d, "admin", f"recover: finished orphaned claim {tid}")
+        print(json.dumps({"recovered": tid, "action": "finish"}))
+
+
 def task_view(d, state, tid, task):
     view = {
         "id": tid, "state": state,
         "subject": task.get("subject", ""), "proposed_by": task.get("proposed_by", ""),
-        "claimed_by": None, "claimed_at": None,
+        "claimed_by": None, "claimed_at": None, "orphan": False,
         "finished_by": None, "finished_at": None, "finish_note": None,
     }
     if state == "claimed":
+        by = claim_owner(d, tid)
         sc = read_sidecar(d, state, tid, "claim")
-        view["claimed_by"] = sc.get("claimed_by")
+        view["claimed_by"] = by
         view["claimed_at"] = sc.get("claimed_at")
+        view["orphan"] = by is None
     elif state == "done":
         sc = read_sidecar(d, state, tid, "finish")
         view["finished_by"] = sc.get("finished_by")
@@ -404,14 +505,18 @@ def cmd_registry(args):
             print(f"{name}: {info.get('desc', '')} [polls: {info.get('cadence', '')}]")
 
 
-def cmd_log(args):
-    d = bus_dir(args)
-    require_self(args.sender, "--from")
-    line = json.dumps({"ts": ts_iso(), "from": args.sender, "event": args.event},
+def _log_event(d, who, event):
+    line = json.dumps({"ts": ts_iso(), "from": who, "event": event},
                       ensure_ascii=False)
     with open(os.path.join(d, "log", utcnow().strftime("%Y-%m-%d") + ".jsonl"),
               "a", encoding="utf-8") as f:
         f.write(line + "\n")
+
+
+def cmd_log(args):
+    d = bus_dir(args)
+    require_self(args.sender, "--from")
+    _log_event(d, args.sender, args.event)
     print("logged")
 
 
@@ -515,11 +620,26 @@ def main(argv=None):
                    help="only purge messages expired longer ago than this")
     p.add_argument("--dry-run", action="store_true")
 
+    p = sub.add_parser("recover")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--list", action="store_true")
+    g.add_argument("--release", action="store_true")
+    g.add_argument("--finish", action="store_true")
+    p.add_argument("taskid", nargs="?")
+    p.add_argument("--note", default="")
+    p.add_argument("--json", action="store_true")
+
     args = ap.parse_args(argv)
+    # Cooperative umask: everything the CLI creates is group-writable and
+    # invisible to unrelated users, regardless of the caller's umask.
+    os.umask(0o007)
+    # Fail closed on remote identity before dispatching anything.
+    check_remote_identity()
     {"init": cmd_init, "send": cmd_send, "broadcast": cmd_send, "inbox": cmd_inbox,
      "read": cmd_read, "ack": cmd_ack, "propose": cmd_propose, "claim": cmd_claim,
      "release": cmd_release, "finish": cmd_finish, "tasks": cmd_tasks,
-     "registry": cmd_registry, "log": cmd_log, "purge": cmd_purge}[args.cmd](args)
+     "registry": cmd_registry, "log": cmd_log, "purge": cmd_purge,
+     "recover": cmd_recover}[args.cmd](args)
 
 
 if __name__ == "__main__":
