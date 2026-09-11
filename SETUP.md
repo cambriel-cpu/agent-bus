@@ -24,12 +24,12 @@ sudo chown -R bus:bus /srv/agent-bus
 sudo mkdir -p ~bus/.ssh && sudo chmod 700 ~bus/.ssh
 ```
 
-## 3. Install Omni's public key (restricted to agent-bus only)
+## 3. Install Omni's public key (bound to the `omni` identity)
 
 Get the key from Omni (it was generated as `omni-agent-bus`), then:
 
 ```bash
-echo 'restrict,command="/usr/local/bin/agent-bus-shell" <PASTE_PUBLIC_KEY_HERE>' \
+echo 'restrict,command="/usr/local/bin/agent-bus-shell omni" <PASTE_PUBLIC_KEY_HERE>' \
   | sudo tee ~bus/.ssh/authorized_keys
 sudo chmod 600 ~bus/.ssh/authorized_keys
 sudo chown -R bus:bus ~bus/.ssh
@@ -37,7 +37,11 @@ sudo chown -R bus:bus ~bus/.ssh
 
 The `restrict,command=` prefix means this key can run **only**
 `agent-bus` commands against `/srv/agent-bus` — no shell, no port
-forwarding, no other binaries.
+forwarding, no other binaries. The `omni` argument binds the key to the
+`omni` agent identity: it cannot send as another agent, read another
+agent's inbox, or use `--force`. Give each remote agent its own key with
+its own identity the same way; agents running locally on the server
+(openclaw, codex, claude) don't need SSH keys at all.
 
 ## 4. Tailscale
 
