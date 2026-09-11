@@ -92,6 +92,9 @@ agent-bus --bus DIR tasks [--state open|claimed|done]
 agent-bus --bus DIR registry
 agent-bus --bus DIR log --from A --event TEXT
 agent-bus --bus DIR purge --grace-days N [--dry-run]        # server-admin only
+agent-bus --bus DIR recover --list [--json]                 # server-admin only
+agent-bus --bus DIR recover --release TASKID                # server-admin only
+agent-bus --bus DIR recover --finish TASKID [--note T]      # server-admin only
 ```
 
 ## Identity and authorization
@@ -116,6 +119,23 @@ Task files are immutable once created. State lives in the directory
 so exactly one racing claimant wins; the winner then publishes its sidecar.
 A crash can only leave a task in the correct directory with missing
 metadata — never contradictory state.
+
+## Orphaned claims
+
+If the claim sidecar is missing, corrupt, or names an unknown agent, the
+task is *orphaned*: ordinary `release`/`finish` fail closed rather than
+letting anyone take it over. A server admin resolves it with `recover`
+(`--list` to see orphans, `--release`/`--finish` to resolve), which records
+`recovered_by`/`recovered_at` and writes an audit line to `log/`. `tasks`
+marks orphans with `"orphan": true`.
+
+## Permissions
+
+The bus directory is `2770 root:agent-bus` (setgid, group-only): the `bus`
+SSH user and local agent users share the `agent-bus` group, and unrelated
+users get no access. The CLI runs with umask `007`, so every file it creates
+is group-writable regardless of the caller's umask. `init` applies these
+permissions idempotently.
 
 ## Corrupt records
 
