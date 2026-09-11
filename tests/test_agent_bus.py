@@ -334,5 +334,47 @@ class BusTest(unittest.TestCase):
         self.assertEqual(oct(mode), "0o660", fn)
 
 
+    # --- forced-command shell ---------------------------------------------------------
+    def test_shell_parses_quoted_args_safely(self):
+        import subprocess
+        shell = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "..", "agent-bus-shell")
+        env = dict(os.environ, AGENT_BUS_BIN=os.path.abspath(BUS_PY),
+                   AGENT_BUS_DIR=self.bus_dir)
+        env.pop("AGENT_BUS_REMOTE_ID", None)
+
+        def sh(identity, command):
+            e = dict(env, SSH_ORIGINAL_COMMAND=command)
+            args = [sys.executable, shell]
+            if identity is not None:
+                args.append(identity)
+            return subprocess.run(args, capture_output=True, text=True, env=e)
+
+        # spaces and shell metacharacters survive as literal arguments
+        r = sh("omni", "agent-bus send --from omni --to omni "
+                       "--subject 'Re: a; b' --body 'x $HOME `y` $(z)'")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        mid = json.loads(r.stdout)["sent"][0]
+        code, out, _ = self.cli("read", "omni", mid)
+        msg = json.loads(out)
+        self.assertEqual(msg["subject"], "Re: a; b")
+        self.assertEqual(msg["body"], "x $HOME `y` $(z)")
+
+        # command chaining is parsed as arguments, never executed
+        marker = os.path.join(self.tmp, "pwned")
+        r = sh("omni", f"agent-bus send --from omni --to omni --subject hi; touch {marker}")
+        self.assertFalse(os.path.exists(marker))
+
+        # non-agent-bus commands and bad identities are rejected
+        self.assertNotEqual(sh("omni", "rm -rf /").returncode, 0)
+        self.assertNotEqual(sh(None, "agent-bus inbox omni").returncode, 0)
+        self.assertNotEqual(sh("", "agent-bus inbox omni").returncode, 0)
+        self.assertNotEqual(sh("mallory", "agent-bus inbox omni").returncode, 0)
+
+        # identity is bound through to the bus
+        r = sh("omni", "agent-bus send --from openclaw --to omni --subject x")
+        self.assertNotEqual(r.returncode, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
