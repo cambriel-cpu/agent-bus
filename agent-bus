@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""agent-bus: minimal inter-agent message bus. stdlib only.
+
+All state lives under --bus DIR. Every write is temp-file + atomic rename.
+See BUS_PROTOCOL.md for the full spec.
+"""
+import argparse
+import datetime
+import json
+import os
+import secrets
+import sys
+
+AGENTS = ("omni", "openclaw", "codex", "claude")
+MSG_TYPES = ("message", "question", "task-request", "task-update", "handoff", "broadcast")
+
+
+def utcnow():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def ts_compact(dt=None):
+    return (dt or utcnow()).strftime("%Y%m%dT%H%M%SZ")
+
+
+def ts_iso(dt=None):
+    return (dt or utcnow()).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def new_id(prefix=""):
+    return f"{prefix}{ts_compact()}-{secrets.token_hex(3)}"
+
+
+def bus_dir(args):
+    d = os.path.abspath(args.bus)
+    if not os.path.isdir(d):
+        sys.exit(f"bus dir not found: {d} (run `init` first)")
+    return d
+
+
+def atomic_write(path, obj):
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def load(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def body_text(args):
+    if args.body_file:
+        with open(args.body_file, encoding="utf-8") as f:
+            return f.read()
+    return args.body or ""
+
+
+def cmd_init(args):
+    d = os.path.abspath(args.bus)
+    for sub in ["inbox/" + a for a in AGENTS] + ["inbox/" + a + "/archive" for a in AGENTS] \
+               + ["tasks/open", "tasks/claimed", "tasks/done", "log"]:
+        os.makedirs(os.path.join(d, sub), exist_ok=True)
+    reg = os.path.join(d, "registry.json")
+    if not os.path.exists(reg):
+        seed = os.path.join(os.path.dirname(os.path.abspath(__file__)), "registry.seed.json")
+        if os.path.exists(seed):
+            with open(seed, encoding="utf-8") as f:
+                atomic_write(reg, json.load(f))
+        else:
+            atomic_write(reg, {"agents": {a: {"desc": "", "cadence": ""} for a in AGENTS}})
+    print(f"bus ready at {d}")
+
+
+def cmd_send(args):
+    d = bus_dir(args)
+    recipients = AGENTS if args.to == "*" else [args.to]
+    if args.to != "*" and args.to not in AGENTS:
+        sys.exit(f"unknown agent: {args.to} (known: {', '.join(AGENTS)})")
+    mtype = "broadcast" if args.to == "*" else args.type
+    if mtype not in MSG_TYPES:
+        sys.exit(f"unknown type: {mtype}")
+    body = body_text(args)
+    now = utcnow()
+    exp = now + datetime.timedelta(seconds=args.ttl_secs)
+    sent = []
+    for to in recipients:
+        msg = {
+            "id": new_id(),
+            "ts": ts_iso(now),
+            "from": args.sender,
+            "to": to,
+            "type": mtype,
+            "subject": args.subject,
+            "body": body,
+            "thread": args.thread,
+            "expires_at": ts_iso(exp),
+        }
+        atomic_write(os.path.join(d, "inbox", to, msg["id"] + ".json"), msg)
+        sent.append(msg["id"])
+    print(json.dumps({"sent": sent, "to": list(recipients)}))
+
+
+def list_inbox(d, agent, include_expired=False):
+    if agent not in AGENTS:
+        sys.exit(f"unknown agent: {agent}")
+    now = ts_iso()
+    out = []
+    ibox = os.path.join(d, "inbox", agent)
+    for fn in sorted(os.listdir(ibox)):
+        if not fn.endswith(".json"):
+            continue
+        msg = load(os.path.join(ibox, fn))
+        expired = msg.get("expires_at", "") < now
+        if expired and not include_expired:
+            continue
+        out.append({
+            "id": msg["id"], "ts": msg["ts"], "from": msg["from"],
+            "type": msg["type"], "subject": msg["subject"],
+            "thread": msg.get("thread"), "expired": expired,
+        })
+    return out
+
+
+def cmd_inbox(args):
+    d = bus_dir(args)
+    msgs = list_inbox(d, args.agent, include_expired=args.all)
+    if args.json:
+        print(json.dumps(msgs, indent=2))
+    elif not msgs:
+        print("(empty)")
+    else:
+        for m in msgs:
+            flag = " [expired]" if m["expired"] else ""
+            print(f"{m['id']}  {m['ts']}  from={m['from']}  [{m['type']}]  {m['subject']}{flag}")
+
+
+def cmd_read(args):
+    d = bus_dir(args)
+    p = os.path.join(d, "inbox", args.agent, args.msgid + ".json")
+    if not os.path.exists(p):
+        p = os.path.join(d, "inbox", args.agent, "archive", args.msgid + ".json")
+    if not os.path.exists(p):
+        sys.exit(f"message not found: {args.msgid}")
+    print(json.dumps(load(p), indent=2, ensure_ascii=False))
+
+
+def cmd_ack(args):
+    d = bus_dir(args)
+    acked = []
+    for mid in args.msgids:
+        src = os.path.join(d, "inbox", args.agent, mid + ".json")
+        if not os.path.exists(src):
+            print(f"skip (not found): {mid}", file=sys.stderr)
+            continue
+        os.replace(src, os.path.join(d, "inbox", args.agent, "archive", mid + ".json"))
+        acked.append(mid)
+    print(json.dumps({"acked": acked}))
+
+
+def cmd_propose(args):
+    d = bus_dir(args)
+    task = {
+        "id": new_id("task-"),
+        "ts": ts_iso(),
+        "proposed_by": args.sender,
+        "subject": args.subject,
+        "body": body_text(args),
+        "status": "open",
+        "claimed_by": None, "claimed_at": None,
+        "finished_at": None, "finish_note": None,
+    }
+    atomic_write(os.path.join(d, "tasks", "open", task["id"] + ".json"), task)
+    print(json.dumps({"proposed": task["id"]}))
+
+
+def cmd_claim(args):
+    d = bus_dir(args)
+    src = os.path.join(d, "tasks", "open", args.taskid + ".json")
+    dst = os.path.join(d, "tasks", "claimed", args.taskid + ".json")
+    if not os.path.exists(src):
+        # already claimed or unknown
+        alt = os.path.join(d, "tasks", "claimed", args.taskid + ".json")
+        if os.path.exists(alt):
+            t = load(alt)
+            sys.exit(f"already claimed by {t.get('claimed_by')} at {t.get('claimed_at')}")
+        sys.exit(f"task not found: {args.taskid}")
+    task = load(src)
+    task["status"] = "claimed"
+    task["claimed_by"] = args.agent
+    task["claimed_at"] = ts_iso()
+    os.replace(src, dst)          # atomic: the lock
+    atomic_write(dst, task)
+    print(json.dumps({"claimed": args.taskid, "by": args.agent}))
+
+
+def cmd_release(args):
+    d = bus_dir(args)
+    src = os.path.join(d, "tasks", "claimed", args.taskid + ".json")
+    if not os.path.exists(src):
+        sys.exit(f"task not claimed: {args.taskid}")
+    task = load(src)
+    if task.get("claimed_by") != args.agent and not args.force:
+        sys.exit(f"claimed by {task.get('claimed_by')}; use --force to override")
+    task["status"] = "open"
+    task["claimed_by"] = None
+    task["claimed_at"] = None
+    dst = os.path.join(d, "tasks", "open", args.taskid + ".json")
+    os.replace(src, dst)
+    atomic_write(dst, task)
+    print(json.dumps({"released": args.taskid}))
+
+
+def cmd_finish(args):
+    d = bus_dir(args)
+    src = os.path.join(d, "tasks", "claimed", args.taskid + ".json")
+    if not os.path.exists(src):
+        sys.exit(f"task not claimed: {args.taskid}")
+    task = load(src)
+    if task.get("claimed_by") != args.agent and not args.force:
+        sys.exit(f"claimed by {task.get('claimed_by')}; use --force to override")
+    task["status"] = "done"
+    task["finished_at"] = ts_iso()
+    task["finish_note"] = args.note or ""
+    dst = os.path.join(d, "tasks", "done", args.taskid + ".json")
+    os.replace(src, dst)
+    atomic_write(dst, task)
+    print(json.dumps({"finished": args.taskid}))
+
+
+def cmd_tasks(args):
+    d = bus_dir(args)
+    states = [args.state] if args.state != "all" else ["open", "claimed", "done"]
+    out = []
+    for st in states:
+        tdir = os.path.join(d, "tasks", st)
+        for fn in sorted(os.listdir(tdir)):
+            if not fn.endswith(".json"):
+                continue
+            t = load(os.path.join(tdir, fn))
+            out.append({
+                "id": t["id"], "state": st, "subject": t["subject"],
+                "proposed_by": t.get("proposed_by"), "claimed_by": t.get("claimed_by"),
+            })
+    if args.json:
+        print(json.dumps(out, indent=2))
+    elif not out:
+        print("(no tasks)")
+    else:
+        for t in out:
+            extra = f" claimed_by={t['claimed_by']}" if t["claimed_by"] else ""
+            print(f"{t['id']}  [{t['state']}]  {t['subject']}  (by {t['proposed_by']}{extra})")
+
+
+def cmd_registry(args):
+    d = bus_dir(args)
+    reg = load(os.path.join(d, "registry.json"))
+    if args.json:
+        print(json.dumps(reg, indent=2))
+    else:
+        for name, info in reg.get("agents", {}).items():
+            print(f"{name}: {info.get('desc','')} [polls: {info.get('cadence','')}]")
+
+
+def cmd_log(args):
+    d = bus_dir(args)
+    line = json.dumps({"ts": ts_iso(), "from": args.sender, "event": args.event},
+                      ensure_ascii=False)
+    with open(os.path.join(d, "log", utcnow().strftime("%Y-%m-%d") + ".jsonl"),
+              "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+    print("logged")
+
+
+def add_common_body(p):
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--body", default="")
+    g.add_argument("--body-file")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="agent-bus")
+    ap.add_argument("--bus", default="/srv/agent-bus")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("init")
+
+    p = sub.add_parser("send")
+    p.add_argument("--from", dest="sender", required=True, choices=AGENTS)
+    p.add_argument("--to", required=True)
+    p.add_argument("--type", default="message")
+    p.add_argument("--subject", required=True)
+    p.add_argument("--thread", default=None)
+    p.add_argument("--ttl-secs", type=int, default=86400)
+    add_common_body(p)
+
+    p = sub.add_parser("broadcast")
+    p.add_argument("--from", dest="sender", required=True, choices=AGENTS)
+    p.add_argument("--subject", required=True)
+    p.add_argument("--thread", default=None)
+    p.add_argument("--ttl-secs", type=int, default=86400)
+    p.set_defaults(to="*")
+    add_common_body(p)
+
+    p = sub.add_parser("inbox")
+    p.add_argument("agent", choices=AGENTS)
+    p.add_argument("--all", action="store_true")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("read")
+    p.add_argument("agent", choices=AGENTS)
+    p.add_argument("msgid")
+
+    p = sub.add_parser("ack")
+    p.add_argument("agent", choices=AGENTS)
+    p.add_argument("msgids", nargs="+")
+
+    p = sub.add_parser("propose")
+    p.add_argument("--from", dest="sender", required=True, choices=AGENTS)
+    p.add_argument("--subject", required=True)
+    add_common_body(p)
+
+    p = sub.add_parser("claim")
+    p.add_argument("agent", choices=AGENTS)
+    p.add_argument("taskid")
+
+    p = sub.add_parser("release")
+    p.add_argument("agent", choices=AGENTS)
+    p.add_argument("taskid")
+    p.add_argument("--force", action="store_true")
+
+    p = sub.add_parser("finish")
+    p.add_argument("agent", choices=AGENTS)
+    p.add_argument("taskid")
+    p.add_argument("--note", default="")
+    p.add_argument("--force", action="store_true")
+
+    p = sub.add_parser("tasks")
+    p.add_argument("--state", default="all", choices=["all", "open", "claimed", "done"])
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("registry")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("log")
+    p.add_argument("--from", dest="sender", required=True, choices=AGENTS)
+    p.add_argument("--event", required=True)
+
+    args = ap.parse_args()
+    {"init": cmd_init, "send": cmd_send, "broadcast": cmd_send, "inbox": cmd_inbox,
+     "read": cmd_read, "ack": cmd_ack, "propose": cmd_propose, "claim": cmd_claim,
+     "release": cmd_release, "finish": cmd_finish, "tasks": cmd_tasks,
+     "registry": cmd_registry, "log": cmd_log}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()
