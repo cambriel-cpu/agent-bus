@@ -56,7 +56,13 @@ class BusTest(unittest.TestCase):
             try:
                 bus.main(["--bus", self.bus_dir, *argv])
             except SystemExit as e:
-                code = e.code or 0
+                # sys.exit("msg") carries the message in e.code; the
+                # interpreter would print it, but we caught it — capture it.
+                if isinstance(e.code, str):
+                    err.write(e.code + "\n")
+                    code = 1
+                else:
+                    code = e.code or 0
             finally:
                 sys.stdout = old
         return code, out.getvalue(), err.getvalue()
@@ -238,6 +244,94 @@ class BusTest(unittest.TestCase):
         code, out, _ = self.cli("inbox", "omni", "--all")
         self.assertIn("fresh", out)
         self.assertNotIn("old", out)
+
+
+    # --- remote identity fail-closed ---------------------------------------------
+    def test_empty_remote_identity_fails_closed(self):
+        os.environ["AGENT_BUS_REMOTE_ID"] = ""
+        code, _, err = self.cli("send", "--from", "omni", "--to", "omni",
+                                "--subject", "x")
+        self.assertNotEqual(code, 0)
+        self.assertIn("unknown remote identity", err)
+
+    def test_unknown_remote_identity_fails_closed(self):
+        os.environ["AGENT_BUS_REMOTE_ID"] = "mallory"
+        code, _, err = self.cli("inbox", "omni")
+        self.assertNotEqual(code, 0)
+        self.assertIn("unknown remote identity", err)
+
+    # --- orphaned claims ---------------------------------------------------------
+    def _make_orphan(self):
+        code, out, _ = self.cli("propose", "--from", "omni", "--subject", "t")
+        tid = json.loads(out)["proposed"]
+        self.cli("claim", "codex", tid)
+        os.unlink(os.path.join(self.bus_dir, "tasks", "claimed", tid + ".claim.json"))
+        return tid
+
+    def test_orphan_release_and_finish_fail_closed(self):
+        tid = self._make_orphan()
+        code, _, err = self.cli("release", "codex", tid)
+        self.assertNotEqual(code, 0)
+        self.assertIn("recover", err)
+        code, _, err = self.cli("finish", "codex", tid)
+        self.assertNotEqual(code, 0)
+        self.assertIn("recover", err)
+        # task is untouched
+        self.assertTrue(os.path.exists(
+            os.path.join(self.bus_dir, "tasks", "claimed", tid + ".json")))
+
+    def test_orphan_visible_in_tasks(self):
+        tid = self._make_orphan()
+        code, out, _ = self.cli("tasks", "--json")
+        view = [t for t in json.loads(out) if t["id"] == tid][0]
+        self.assertTrue(view["orphan"])
+        self.assertIsNone(view["claimed_by"])
+
+    def test_recover_lists_and_releases_orphan(self):
+        tid = self._make_orphan()
+        code, out, _ = self.cli("recover", "--list")
+        self.assertEqual(code, 0)
+        self.assertIn(tid, out)
+        code, out, _ = self.cli("recover", "--release", tid)
+        self.assertEqual(code, 0)
+        self.assertTrue(os.path.exists(
+            os.path.join(self.bus_dir, "tasks", "open", tid + ".json")))
+
+    def test_recover_finishes_orphan_with_audit(self):
+        tid = self._make_orphan()
+        code, out, _ = self.cli("recover", "--finish", tid, "--note", "salvaged")
+        self.assertEqual(code, 0)
+        with open(os.path.join(self.bus_dir, "tasks", "done", tid + ".finish.json")) as f:
+            sc = json.load(f)
+        self.assertEqual(sc["recovered_by"], "admin")
+        self.assertEqual(sc["finish_note"], "salvaged")
+
+    def test_recover_rejects_non_orphan(self):
+        code, out, _ = self.cli("propose", "--from", "omni", "--subject", "t")
+        tid = json.loads(out)["proposed"]
+        self.cli("claim", "codex", tid)  # healthy claim, sidecar intact
+        code, _, err = self.cli("recover", "--release", tid)
+        self.assertNotEqual(code, 0)
+        self.assertIn("not an orphaned claim", err)
+
+    def test_recover_denied_remotely(self):
+        os.environ["AGENT_BUS_REMOTE_ID"] = "omni"
+        code, _, _ = self.cli("recover", "--list")
+        self.assertNotEqual(code, 0)
+
+    # --- permissions ----------------------------------------------------------------
+    def test_init_sets_2770_dirs(self):
+        for root, dirs, _ in os.walk(self.bus_dir):
+            for p in [root] + [os.path.join(root, d) for d in dirs]:
+                mode = oct(os.stat(p).st_mode & 0o7777)
+                self.assertEqual(mode, "0o2770", p)
+
+    def test_new_files_are_group_writable_not_world_accessible(self):
+        self.cli("send", "--from", "omni", "--to", "omni", "--subject", "x")
+        ibox = os.path.join(self.bus_dir, "inbox", "omni")
+        fn = os.path.join(ibox, os.listdir(ibox)[0])
+        mode = os.stat(fn).st_mode & 0o777
+        self.assertEqual(oct(mode), "0o660", fn)
 
 
 if __name__ == "__main__":
